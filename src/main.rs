@@ -320,6 +320,11 @@ fn main() -> Result<(), Cow<'static, str>> {
     if colorspace == qoi::ColorSpace::Srgb {
         png.set_srgb(png::SrgbRenderingIntent::Perceptual);
     }
+    // Avoid expensive compression. The shell's thumbnailer consumes and re-encodes it anyway!
+    // This still pulls in flate2 and fdeflate libraries :V
+    png.set_compression(png::Compression::Fast);
+    png.set_adaptive_filter(png::AdaptiveFilterType::NonAdaptive);
+    png.set_filter(png::FilterType::NoFilter);
     // Write XDG Metas (https://specifications.freedesktop.org/thumbnail-spec/thumbnail-spec-latest.html#CREATION)
     let try_metas = || -> Result<(), png::EncodingError> {
         // PNG
@@ -340,11 +345,8 @@ fn main() -> Result<(), Cow<'static, str>> {
 
         Ok(())
     };
+    // Write metas then write pixels
     try_metas().map_err(|enc| Cow::Owned(format!("failed to write metadata: {enc}")))?;
-    // compression. We're using fairly small images, so it shouldn't take long.
-    // but at the same time, we're using fairly small images, so compression won't be super important.
-    // Agh!
-    png.set_compression(png::Compression::Best);
     png.write_header()
         .and_then(|mut png| png.write_image_data(&scaled_rgba))
         .map_err(|enc| Cow::Owned(format!("failed to write png: {enc}")))
