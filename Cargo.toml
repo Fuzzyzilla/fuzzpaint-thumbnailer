@@ -1,0 +1,21 @@
+[package]
+name = "fuzzpaint-thumbnailer"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+az = "1.2.1"
+image = { version = "0.24.7", default-features = false, features = [
+    "qoi",
+    "png",
+] }
+
+[profile.release]
+# Smallest we can get it without reducing compat.
+# Results in ~480K, which i'm happy with!
+panic = "abort"
+strip = true
+lto = true
+codegen-units = 1
