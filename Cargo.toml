@@ -7,14 +7,14 @@ edition = "2021"
 
 [dependencies]
 az = "1.2.1"
-image = { version = "0.24.7", default-features = false, features = [
-    "qoi",
-    "png",
-] }
+bytemuck = { version = "1.14.0", features = ["derive"] }
+fast_image_resize = "2.7.3"
+png = "0.17.10"
+qoi = "0.4.1"
 
 [profile.release]
 # Smallest we can get it without reducing compat.
-# Results in ~480K, which i'm happy with!
+# Results in ~677k, which i'm happy with!
 panic = "abort"
 strip = true
 lto = true

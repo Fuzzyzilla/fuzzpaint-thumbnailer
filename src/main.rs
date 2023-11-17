@@ -8,18 +8,18 @@
 //!
 //! Reads a file path from arg3, writing a PNG of the resized image to that location.
 //!
-//! Todo[XDG]: Embed image attributes into the PNG, as specified by
-//!   https://specifications.freedesktop.org/thumbnail-spec/thumbnail-spec-latest.html#CREATION
 //! Todo[XDG]: Accept file URI instead of path
 //! Todo[XDG]: write failure logs to $XDG_CACHE_HOME/thumbnails/fail/fuzzpaint-thumbnailer
 //!
 //! Todo[WINDOWS]: implement IThumbnailProvider
+//! Todo[WINDOWS]: allow RGB8 images
 use az::{CheckedAs, SaturatingAs};
 use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Error as IOError, Read, Result as IOResult, Seek};
 
 /// Bail if the thumb image is larger than this.
 const MAX_INPUT_IMAGE_DIMENSION: u32 = 1024;
+const MIME_TYPE: &'static str = "application/x.fuzzpaint-doc";
 
 /// std::io::Take, except it's Seek. Not sure why std's isn't D:
 ///
@@ -190,10 +190,15 @@ fn read_fzp_thmb<R: Read + BufRead + Seek>(mut r: R) -> IOResult<MyTake<R>> {
         Err(IOError::other("document does not contain a thumbnail"))
     }
 }
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+#[repr(C, align(4))]
+struct U8x4(pub [u8; 4]);
 fn main() -> Result<(), Cow<'static, str>> {
-    let args: Vec<_> = std::env::args().skip(1).take(3).collect();
-    let Ok([in_path, size, outpath]): Result<[String; 3], _> = args.try_into() else {
-        return Err("Usage: fuzzpaint-thumbnailer <inpath> <size in px> <outpath>".into());
+    let args: Vec<_> = std::env::args().skip(1).take(4).collect();
+    let Ok([in_path, size, out_path, in_uri]): Result<[String; 4], _> = args.try_into() else {
+        return Err(
+            "Usage: fuzzpaint-thumbnailer <in_path> <size in px> <out_path> <in_uri>".into(),
+        );
     };
 
     let Ok(size): Result<u32, _> = size.parse() else {
@@ -202,58 +207,145 @@ fn main() -> Result<(), Cow<'static, str>> {
     if size == 0 {
         return Err("<size> parameter must not be zero".into());
     }
-    // We only have so much data to work with!
+    // We only have so much input data to work with!
     // I don't believe any shell would request anything much larger than 512,
     // but just in case to avoid expensive calc and lots of mem for an accidental request.
     if size > 2048 {
         return Err("<size> parameter larger than reasonable".into());
     }
 
-    // Fetch a reader of the raw image data.
-    let qoi_reader = std::fs::File::open(in_path)
-        .map(BufReader::new)
-        .and_then(read_fzp_thmb)
-        .map_err(|io| Cow::Owned(format!("failed to read inpath: {io}").into()))?;
+    // ========== Read FZP ============
+    let (modified_unix_time, qoi_reader) = {
+        // Open file and stat modification time (both required for thumbnailing according to XDG)
+        let (file, mod_time) = std::fs::File::open(in_path)
+            .and_then(|file| {
+                file.metadata()
+                    .and_then(|meta| meta.modified())
+                    .map(|time| (file, time))
+            })
+            .map_err(|io| Cow::Owned(format!("failed to access in_path: {io}")))?;
 
-    let try_downsample =
-        move || -> image::ImageResult<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
-            let mut reader = image::io::Reader::with_format(qoi_reader, image::ImageFormat::Qoi);
-            let mut limits = image::io::Limits::default();
-            limits.max_image_height = Some(MAX_INPUT_IMAGE_DIMENSION);
-            limits.max_image_width = Some(MAX_INPUT_IMAGE_DIMENSION);
-            reader.limits(limits);
-            let image = reader.decode()?;
+        let unix_time = mod_time
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            // Unlikely err lol
+            .map_err(|e| Cow::Owned(e.to_string()))?;
 
-            let (scaled_width, scaled_height) = {
-                let max_dim = image.width().max(image.height());
-                let scale_factor = size as f32 / max_dim as f32;
-                (
-                    // Non-neg, as everything comes from u32's to begin with.
-                    // May be zero.
-                    (image.width() as f32 * scale_factor).ceil() as u32,
-                    (image.width() as f32 * scale_factor).ceil() as u32,
-                )
-            };
+        // Fetch a reader of the raw image data.
+        let qoi_reader = read_fzp_thmb(BufReader::new(file))
+            .map_err(|io| Cow::Owned(format!("failed to parse input file: {io}").into()))?;
 
-            // Freedesktop thumb requires RGBA8. For windows, I will relax this req.
-            // QOI is always RGB or RGBA so this will do nothing or expand mem.
-            let rgba_image = image.into_rgba8();
-            let downsampled = image::imageops::resize(
-                &rgba_image,
-                scaled_width,
-                scaled_height,
-                // Reasonably nice quality at good speeds.
-                // We're working with such small images that it isn't an issue :3
-                image::imageops::FilterType::Triangle,
-            );
+        (unix_time, qoi_reader)
+    };
+    // ========== Read QOI ============
+    let (width, height, colorspace, rgba, rgba_len_bytes) = {
+        let mut image_decoder = qoi::Decoder::from_stream(qoi_reader)
+            .map_err(|img| Cow::Owned(format!("failed to parse thumbnail header: {img}")))?
+            // XDG thumbnailer requires RGBA8
+            .with_channels(qoi::Channels::Rgba);
 
-            Ok(downsampled)
-        };
+        let qoi::Header {
+            width,
+            height,
+            colorspace,
+            ..
+        } = *image_decoder.header();
+        if width > MAX_INPUT_IMAGE_DIMENSION || height > MAX_INPUT_IMAGE_DIMENSION {
+            return Err("thumbnail size exceeds limit".into());
+        }
+        let (width, height) = std::num::NonZeroU32::new(width)
+            .zip(std::num::NonZeroU32::new(height))
+            .ok_or_else(|| Cow::Borrowed("thumbnail has zero size"))?;
 
-    let downsampled = try_downsample()
-        .map_err(|image_err| Cow::Owned(format!("failed to read thumbnail data: {image_err}")))?;
+        // Force align of buffer to 4, for SIMD resize later
+        let len_bytes = image_decoder.required_buf_len();
+        // Round up length
+        let mut data = vec![U8x4([0u8; 4]); len_bytes.div_ceil(4)];
+        // take exact number of bytes requested (decode fails otherwise)
+        // OK - we're casing to bytes, no align requirement
+        let data_slice = &mut bytemuck::cast_slice_mut(&mut data)[..len_bytes];
+        image_decoder
+            .decode_to_buf(data_slice)
+            .map_err(|img| Cow::Owned(format!("failed to parse thumbnail data: {img}")))?;
 
-    downsampled
-        .save_with_format(outpath, image::ImageFormat::Png)
-        .map_err(|image_err| Cow::Owned(format!("failed to write png: {image_err}")))
+        (width, height, colorspace, data, len_bytes)
+    };
+
+    // ============= Scale ===============
+    let (scaled_width, scaled_height) = {
+        let max_dim = width.max(height);
+        let scale_factor = size as f32 / max_dim.get() as f32;
+        let scaled_width = (width.get() as f32 * scale_factor).ceil() as u32;
+        let scaled_height = (height.get() as f32 * scale_factor).ceil() as u32;
+
+        std::num::NonZeroU32::new(scaled_width)
+            .zip(std::num::NonZeroU32::new(scaled_height))
+            .ok_or_else(|| Cow::Borrowed("scaled thumbnail has zero size"))?
+    };
+
+    let scaled_rgba = {
+        use fast_image_resize as fr;
+        let mut resizer = fr::Resizer::new(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
+
+        let source_view = fr::ImageView::<'_, fr::pixels::U8x4>::from_buffer(
+            width,
+            height,
+            // OK - we're casing to bytes, no align requirement
+            &bytemuck::cast_slice(&rgba)[..rgba_len_bytes],
+        )
+        // OK - we manually aligned rgba to 4.
+        .unwrap();
+        // Alloc destination buffer
+        let mut destination = fr::Image::new(scaled_width, scaled_height, fr::PixelType::U8x4);
+
+        // TODO: Wrong interp for sRGB
+        resizer
+            .resize(
+                &fr::DynamicImageView::U8x4(source_view),
+                &mut destination.view_mut(),
+            )
+            // Unwrap ok - we unconditionally use the same pixel type constant for both.
+            .unwrap();
+
+        destination.into_vec()
+    };
+    // Dealloc unscaled image asap
+    drop(rgba);
+
+    // ============= Write PNG ===============
+    let file = std::fs::File::create(out_path)
+        .map_err(|io| Cow::Owned(format!("failed to open out_path for writing: {io}")))?;
+    let mut png = png::Encoder::new(file, scaled_width.get(), scaled_height.get());
+    png.set_color(png::ColorType::Rgba);
+    png.set_depth(png::BitDepth::Eight);
+    if colorspace == qoi::ColorSpace::Srgb {
+        png.set_srgb(png::SrgbRenderingIntent::Perceptual);
+    }
+    // Write XDG Metas (https://specifications.freedesktop.org/thumbnail-spec/thumbnail-spec-latest.html#CREATION)
+    let try_metas = || -> Result<(), png::EncodingError> {
+        // PNG
+        png.add_text_chunk("Software".into(), "Fuzzpaint".into())?;
+        // XDG required
+        png.add_text_chunk("Thumb::URI".into(), in_uri)?;
+        png.add_text_chunk(
+            "Thumb::MTime".into(),
+            modified_unix_time.as_secs().to_string(),
+        )?;
+        // XDG Additional
+        png.add_text_chunk("Thumb::Mimetype".into(), MIME_TYPE.into())?;
+        // XDG Filetype specific
+        png.add_text_chunk("Thumb::Image::Width".into(), "1080".into())?;
+        png.add_text_chunk("Thumb::Image::Height".into(), "1080".into())?;
+        // XDG Fuzzpaint ext
+        png.add_text_chunk("X-Fuzzpaint::Soup".into(), "very good".into())?;
+
+        Ok(())
+    };
+    try_metas().map_err(|enc| Cow::Owned(format!("failed to write metadata: {enc}")))?;
+    // compression. We're using fairly small images, so it shouldn't take long.
+    // but at the same time, we're using fairly small images, so compression won't be super important.
+    // Agh!
+    png.set_compression(png::Compression::Best);
+    png.write_header()
+        .and_then(|mut png| png.write_image_data(&scaled_rgba))
+        .map_err(|enc| Cow::Owned(format!("failed to write png: {enc}")))
 }

@@ -1,4 +1,4 @@
 [Thumbnailer Entry]
 TryExec=/usr/local/bin/fuzzpaint-thumbnailer
-Exec=/usr/local/bin/fuzzpaint-thumbnailer %i %s %o
+Exec=/usr/local/bin/fuzzpaint-thumbnailer %i %s %o %u
 MimeType=application/x.fuzzpaint-doc;
